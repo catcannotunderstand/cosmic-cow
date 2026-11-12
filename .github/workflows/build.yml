@@ -1,0 +1,102 @@
+# main にプッシュするたびに、
+#   1. コンテナイメージを作って GitHub のレジストリ(ghcr.io)に置く
+#   2. Azure Container Apps のアプリ circl-mcp を、そのイメージに入れ替える
+# Azure へのログインは OIDC(パスワードや鍵は保存しない)。setup_github_deploy.sh で1回だけ設定する。
+name: build-and-deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # setup_github_deploy.sh が表示した値を書く。パスワードではない(このリポジトリの main からしか使えない)
+  # 空のうちは、イメージを作るだけで Azure の入れ替えは飛ばす
+  AZURE_CLIENT_ID: ""
+  AZURE_TENANT_ID: ""
+  AZURE_SUBSCRIPTION_ID: ""
+
+concurrency:
+  group: build-and-deploy
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 偽の CIRCL を使った動作確認
+        run: |
+          pip install -r requirements.txt
+          bash test/run.sh
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.name.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: イメージ名を小文字にする
+        id: name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.name.outputs.image }}:latest
+            ${{ steps.name.outputs.image }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha,scope=circl
+          cache-to: type=gha,mode=max,scope=circl
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # OIDC の一時的な身分証明を発行してもらうため
+    steps:
+      - name: 設定の確認
+        run: |
+          if [ -z "$AZURE_CLIENT_ID" ]; then
+            echo "::notice::Azure の設定(AZURE_CLIENT_ID など)がまだないので、入れ替えは飛ばします"
+          fi
+
+      - uses: azure/login@v2
+        if: env.AZURE_CLIENT_ID != ''
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Azure のアプリを新しいイメージに入れ替える
+        if: env.AZURE_CLIENT_ID != ''
+        run: |
+          az config set extension.use_dynamic_install=yes_without_prompt >/dev/null
+          az extension add -n containerapp --upgrade -y >/dev/null 2>&1
+          az containerapp update -n circl-mcp -g cve-rg \
+            --image "${{ needs.build.outputs.image }}:${{ github.sha }}" -o none
+          az containerapp revision list -n circl-mcp -g cve-rg \
+            --query "[?properties.active].{name:name, image:properties.template.containers[0].image, state:properties.runningState}" -o table
