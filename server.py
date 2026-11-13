@@ -423,37 +423,87 @@ def _sighting_item(it: dict) -> dict:
     }.items() if v}
 
 
-def _priority(s: dict, epss: Optional[dict], kev_entries: list, sighting_counts: dict) -> dict:
+SCANNER_RE = re.compile(r"scann|\bscan\b|detect|checker|\bcheck(s|ing)?\b|nuclei|triage|検出|検知|スキャン|診断", re.I)
+EXPLOIT_RE = re.compile(r"exploit|weaponi[sz]|proof[- ]of[- ]concept|\bpoc\b|reverse shell|攻撃コード|エクスプロイト", re.I)
+
+SIGHTING_MEANING = {
+    "seen": "SNS・ニュース・ブログなどで言及された回数。攻撃を観測したという意味ではない",
+    "published-proof-of-concept": "PoC(攻撃コード)が公開されたという報告。多くは GitHub の新しいリポジトリを"
+                                  "自動で拾ったもので未検証。スキャナーや偽物(マルウェア入り)も混ざる",
+    "exploited": "実際に悪用されたという報告(ハニーポットや脅威情報など)",
+    "confirmed": "脆弱性が本物だと確認したという報告(悪用の確認ではない)",
+    "not-exploited": "悪用されていないという報告",
+    "patched": "修正済みという報告",
+}
+
+
+def _report_text(it: dict) -> str:
+    """観測の本文から、判定に使う部分(リポジトリ名と説明)を取り出す。
+    GitHub 監視ボットの定型文は「#POC」などのハッシュタグを必ず含むので、説明の部分だけを見る。"""
+    c = str(it.get("content") or "")
+    name = re.search(r"项目名称[::]\s*(.+)", c)
+    desc = c.split("项目描述", 1)[1] if "项目描述" in c else c
+    return ((name.group(1) if name else "") + " " + desc).strip()
+
+
+def _poc_report(it: dict) -> dict:
+    text = _report_text(it)
+    src = str(it.get("source") or "")
+    if SCANNER_RE.search(text):
+        kind = "scanner"          # 影響を受けるか調べるだけのツール。攻撃コードではない
+    elif EXPLOIT_RE.search(text):
+        kind = "exploit_claim"    # 攻撃コードを名乗っている(未検証)
+    else:
+        kind = "unclear"
+    via = ("GitHub の新着リポジトリを監視する Telegram ボット" if "t.me/GithubRedTeam" in src
+           else "GitHub" if "github.com" in src else None)
+    return {k: v for k, v in {
+        "kind": kind, "date": it.get("creation_timestamp"), "source": cut(src, 300), "via": via,
+        "summary": cut(text, 250), "author": (it.get("author") or {}).get("login"),
+    }.items() if v}
+
+
+def _priority(s: dict, epss: Optional[dict], kev_entries: list, exploited_n: int, poc: list) -> dict:
     """目安の優先度。判断材料を一緒に返す(最終判断は使う人の環境しだい)。"""
     reasons = []
     top = (s.get("cvss") or [{}])[0].get("score")
-    exploited = bool(s.get("cisa_kev")) or any(k.get("exploited") for k in kev_entries) \
-        or sighting_counts.get("exploited", 0) > 0
+    exploited = bool(s.get("cisa_kev")) or any(k.get("exploited") for k in kev_entries) or exploited_n > 0
     p = epss.get("epss") if isinstance(epss, dict) and isinstance(epss.get("epss"), float) else None
+    claims = sum(1 for r in poc if r.get("kind") in ("exploit_claim", "unclear"))
+    scanners = sum(1 for r in poc if r.get("kind") == "scanner")
     if s.get("cisa_kev"):
         reasons.append(f'CISA KEV に掲載({s["cisa_kev"].get("date_added")})')
     if any(k.get("exploited") for k in kev_entries):
         reasons.append("CIRCL の KEV 記録で悪用あり")
-    if sighting_counts.get("exploited"):
-        reasons.append(f'悪用の観測 {sighting_counts["exploited"]}件')
-    if sighting_counts.get("published-proof-of-concept"):
-        reasons.append(f'PoC 公開の観測 {sighting_counts["published-proof-of-concept"]}件')
+    if exploited_n:
+        reasons.append(f"悪用の報告 {exploited_n}件")
+    if claims:
+        reasons.append(f"攻撃コードを名乗る(か中身が不明な)公開の報告 {claims}件(未検証)")
+    if scanners:
+        reasons.append(f"スキャナー・検出ツールの公開 {scanners}件(攻撃コードではない)")
     if p is not None:
-        reasons.append(f"EPSS {p:.3f}(上位 {100 * (1 - epss['percentile']):.1f}%)")
+        pct = epss.get("percentile")
+        where = f"、全CVEの {pct * 100:.1f}% がこれ以下" if isinstance(pct, float) else ""
+        reasons.append(f"EPSS {p * 100:.1f}%(30日以内に悪用される確率の推定{where})")
     if top is not None:
         reasons.append(f"CVSS {top}")
+    else:
+        reasons.append("CVSS はまだ付いていない")
     if exploited:
-        level = "最優先(悪用が確認されている)"
-    elif (p is not None and p >= 0.1) or sighting_counts.get("published-proof-of-concept"):
-        level = "高(悪用の可能性が高い、またはPoCがある)"
+        level = "最優先(悪用の報告・記録がある)"
+    elif (p is not None and p >= 0.1) or claims:
+        level = "高(悪用の可能性が高い、または攻撃コードを名乗るものが公開されている)"
     elif top is not None and top >= 9:
         level = "中〜高(深刻度は高いが、悪用の兆候は見つからない)"
     elif top is not None and top >= 7:
         level = "中"
+    elif top is None:
+        level = "判断材料が少ない(CVSS 未付与。説明文の深刻度を参考に)"
     else:
         level = "低〜中"
     return {"level": level, "reasons": reasons,
-            "note": "目安。実際の優先度は、該当製品を使っているか・外部に公開しているかで変わる"}
+            "note": "機械的な目安。PoC や悪用の報告は自動収集で未検証のものを含む。"
+                    "実際の優先度は、該当製品を使っているか・外部に公開しているかで変わる"}
 
 
 @mcp.tool()
@@ -465,7 +515,12 @@ async def triage_cve(vuln_id: str) -> dict:
     epss_t = circl("GET", f"/epss/{seg(vid, 'vuln_id')}", allow_404=True)
     kev_t = circl("GET", "/kev/", {"vuln_id": vid, "per_page": 10, "exploited": "all"}, allow_404=True)
     sig_t = circl("GET", "/sighting/", {"vuln_id": vid, "per_page": 100}, allow_404=True)
-    rec, epss_raw, kev_raw, sig_raw = await asyncio.gather(rec_t, epss_t, kev_t, sig_t, return_exceptions=True)
+    # PoC と悪用の報告は、話題の多い CVE だと最新100件からこぼれるので、種類を指定して別に取る
+    poc_t = circl("GET", "/sighting/", {"vuln_id": vid, "type": "published-proof-of-concept", "per_page": 20},
+                  allow_404=True)
+    exp_t = circl("GET", "/sighting/", {"vuln_id": vid, "type": "exploited", "per_page": 20}, allow_404=True)
+    rec, epss_raw, kev_raw, sig_raw, poc_raw, exp_raw = await asyncio.gather(
+        rec_t, epss_t, kev_t, sig_t, poc_t, exp_t, return_exceptions=True)
     if isinstance(rec, Exception):
         raise rec
     if rec is None:
@@ -483,15 +538,34 @@ async def triage_cve(vuln_id: str) -> dict:
             counts[it["type"]] = counts.get(it["type"], 0) + 1
             d = it.get("creation_timestamp") or ""
             latest[it["type"]] = max(latest.get(it["type"], ""), d)
-    sightings = {"counts_in_latest_100": counts, "latest_by_type": latest,
-                 "total": sig_meta.get("count", len(sig_items))}
+    def typed(raw: Any) -> tuple[list, int]:
+        if isinstance(raw, Exception) or raw is None:
+            return [], 0
+        items, meta = _list_of(raw)
+        items = [i for i in items if isinstance(i, dict)]
+        return items, int(meta.get("count", len(items)) or 0)
+
+    poc_items, poc_n = typed(poc_raw)
+    exp_items, exp_n = typed(exp_raw)
+    poc = [_poc_report(i) for i in poc_items]
+    exploited_reports = [_sighting_item(i) for i in exp_items[:10]]
+    sightings = {"total": sig_meta.get("count", len(sig_items)),
+                 "counts_in_latest_100": counts, "latest_by_type": latest,
+                 "meaning": {k: v for k, v in SIGHTING_MEANING.items() if k in counts or
+                             (k == "published-proof-of-concept" and poc) or (k == "exploited" and exp_n)}}
     out = {"found": True, **s,
            "epss": epss or "記録なし",
            "kev_records": kev_entries or "記録なし",
            "sightings": sightings if sig_items else "記録なし",
-           "priority": _priority(s if isinstance(s, dict) else {}, epss, kev_entries, counts),
+           "poc_reports": {"total": poc_n, "items": poc,
+                           "kind_meaning": {"scanner": "影響を受けるか調べるだけのツール",
+                                            "exploit_claim": "攻撃コードを名乗っている(未検証。偽物やマルウェアの場合もある)",
+                                            "unclear": "説明からは判断できない"}} if poc else "報告なし",
+           "exploited_reports": {"total": exp_n, "items": exploited_reports} if exp_n else "報告なし",
+           "priority": _priority(s if isinstance(s, dict) else {}, epss, kev_entries, exp_n, poc),
            "circl_url": f"https://vulnerability.circl.lu/vuln/{vid.lower()}"}
-    errors = [n for n, v in (("epss", epss_raw), ("kev", kev_raw), ("sightings", sig_raw)) if isinstance(v, Exception)]
+    errors = [n for n, v in (("epss", epss_raw), ("kev", kev_raw), ("sightings", sig_raw),
+                             ("poc", poc_raw), ("exploited", exp_raw)) if isinstance(v, Exception)]
     if errors:
         out["partial_errors"] = errors
     return out
@@ -535,7 +609,9 @@ async def get_epss(vuln_ids: list[str]) -> dict:
             out[v] = {"error": str(r)}
         else:
             out[v] = (_epss_item(r) if r is not None else None) or "記録なし"
-    return {"epss": out, "about": "EPSS は FIRST.org の推定値。0.1 以上なら悪用の可能性が高めとされる"}
+    return {"epss": out, "about": "epss は FIRST.org による「30日以内に悪用される確率」の推定(0〜1)。"
+                                  "percentile は全CVEのうちこれ以下の割合(0.35 なら下から35%の位置)。"
+                                  "0.1 以上なら悪用の可能性が高めとされる"}
 
 
 @mcp.tool()
@@ -571,7 +647,11 @@ async def get_sightings(vuln_id: Optional[str] = None, type: Optional[str] = Non
               "page": clamp(page, 1, 1000), "per_page": clamp(per_page, 1, 100)}
     data = await circl("GET", "/sighting/", params)
     items, meta = _list_of(data)
-    return {"metadata": meta, "items": [_sighting_item(i) for i in items if isinstance(i, dict)]}
+    items = [i for i in items if isinstance(i, dict)]
+    meaning = {type: SIGHTING_MEANING[type]} if type in SIGHTING_MEANING else SIGHTING_MEANING
+    if type == "published-proof-of-concept":
+        return {"metadata": meta, "meaning": meaning, "items": [_poc_report(i) for i in items]}
+    return {"metadata": meta, "meaning": meaning, "items": [_sighting_item(i) for i in items]}
 
 
 @mcp.tool()

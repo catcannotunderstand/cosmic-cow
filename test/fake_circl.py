@@ -86,12 +86,35 @@ async def kev(req: Request):
         "references": [{"id": "CVE-2021-44228", "url": "https://nvd.nist.gov/vuln/detail/CVE-2021-44228"}]}]})
 
 
+BOT = ("🚨 GitHub 监控消息提醒\n\n🚨 发现关键词： #CVE-2026 #POC #RCE\n\n📦 项目名称： {name}\n"
+       "👤 项目作者： someone\n🛠 开发语言： Python\n\n📝 项目描述：\n{desc}")
+POC = [
+    ("cve-2026-119618-scanner", "Tiered scanner for CVE-2026-119618: h2 presence, banner range"),
+    ("CVE-2026-119618", "Weaponised PoC driver for CVE-2026-119618, the mod_http2 race"),
+    ("CVE-2026-119618", "Apache httpd mod_http2 races on the connection allocator"),
+]
+
+
 async def sighting(req: Request):
-    calls.append(f"sighting {dict(req.query_params)}")
+    q = dict(req.query_params)
+    calls.append(f"sighting {q}")
+    t = q.get("type")
+    if t == "published-proof-of-concept":
+        items = [{"uuid": f"p{i}", "creation_timestamp": f"2026-11-12T0{i}:00:00Z", "type": t,
+                  "source": f"https://t.me/GithubRedTeam/{110000 + i}", "vulnerability": "CVE-2021-44228",
+                  "content": BOT.format(name=n, desc=d), "author": {"login": "automation"}}
+                 for i, (n, d) in enumerate(POC)]
+        return JSONResponse({"metadata": {"count": len(items)}, "data": items})
+    if t == "exploited":
+        items = [{"uuid": "e1", "creation_timestamp": "2026-11-11T00:00:00Z", "type": t,
+                  "source": "honeypot-feed", "vulnerability": "CVE-2021-44228", "author": {"login": "automation"}}]
+        return JSONResponse({"metadata": {"count": 3}, "data": items})
     items = [{"uuid": f"s{i}", "creation_timestamp": f"2026-11-{10 + i % 3:02d}T00:00:00Z",
               "type": ["seen", "exploited", "published-proof-of-concept"][i % 3],
               "source": "https://mastodon.example/post", "content": "", "vulnerability": "CVE-2021-44228",
               "author": {"login": "automation"}} for i in range(9)]
+    if t:
+        items = [i for i in items if i["type"] == t]
     return JSONResponse({"metadata": {"count": 1992, "page": 1, "per_page": 100}, "data": items})
 
 

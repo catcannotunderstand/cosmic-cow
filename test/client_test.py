@@ -42,6 +42,15 @@ async def main():
                   "triage: KEV 記録を要約(長いメモは除く)")
             check(t["sightings"]["counts_in_latest_100"]["exploited"] == 3, "triage: 観測を種類ごとに数える")
             check(t["priority"]["level"].startswith("最優先"), "triage: 悪用ありなら最優先")
+            kinds = [r["kind"] for r in t["poc_reports"]["items"]]
+            check(kinds == ["scanner", "exploit_claim", "unclear"], f"triage: PoC の報告を分類する {kinds}")
+            check(t["poc_reports"]["items"][0]["via"].startswith("GitHub の新着"), "triage: PoC の出どころを示す")
+            check(t["exploited_reports"]["total"] == 3, "triage: 悪用の報告は種類を指定して数える")
+            rs = " / ".join(t["priority"]["reasons"])
+            check("スキャナー・検出ツールの公開 1件" in rs and "名乗る(か中身が不明な)公開の報告 2件" in rs,
+                  "triage: スキャナーと攻撃コードを分けて理由に書く")
+            check("全CVEの 100.0% がこれ以下" in rs and "上位" not in rs, "triage: EPSS の位置の表記")
+            check("seen" in t["sightings"]["meaning"], "triage: 観測の種類の意味を添える")
             check(len(t["description"]) < 1600, "triage: 長い説明文を切る")
             check(len(t["references"]) == 15, "triage: 参考URLを15件までにする")
             check(t["cwe"] == ["CWE-502 Deserialization of Untrusted Data"], "triage: CWE")
@@ -68,7 +77,9 @@ async def main():
             check(err, "get_kev: 日付の形式を確かめる")
 
             err, t = await call(s, "get_sightings", {"vuln_id": "CVE-2021-44228", "type": "exploited"})
-            check(not err and t["metadata"]["count"] == 1992, "get_sightings: 件数情報を返す")
+            check(not err and t["metadata"]["count"] == 3, "get_sightings: 件数情報を返す")
+            err, t = await call(s, "get_sightings", {"vuln_id": "CVE-2021-44228", "type": "published-proof-of-concept"})
+            check(not err and t["items"][0]["kind"] == "scanner" and "meaning" in t, "get_sightings: PoC は分類して返す")
             err, _ = await call(s, "get_sightings", {"type": "hacked"})
             check(err, "get_sightings: 種類を確かめる")
 
