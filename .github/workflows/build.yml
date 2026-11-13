@@ -12,9 +12,9 @@ on:
 env:
   # setup_github_deploy.sh が表示した値を書く。パスワードではない(このリポジトリの main からしか使えない)
   # 空のうちは、イメージを作るだけで Azure の入れ替えは飛ばす
-  AZURE_CLIENT_ID: ""
-  AZURE_TENANT_ID: ""
-  AZURE_SUBSCRIPTION_ID: ""
+  AZURE_CLIENT_ID: "5229317c-a12b-4cb3-9d6e-73a52fe593fe"
+  AZURE_TENANT_ID: "73331780-2261-4d6e-8035-b6ab264b65ae"
+  AZURE_SUBSCRIPTION_ID: "3e675fc4-04d3-48c2-ab3a-d196daf8f4b3"
 
 concurrency:
   group: build-and-deploy
