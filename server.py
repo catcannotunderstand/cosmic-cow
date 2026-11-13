@@ -443,7 +443,8 @@ def _report_text(it: dict) -> str:
     c = str(it.get("content") or "")
     name = re.search(r"项目名称[::]\s*(.+)", c)
     desc = c.split("项目描述", 1)[1] if "项目描述" in c else c
-    return ((name.group(1) if name else "") + " " + desc).strip()
+    desc = desc.split("🔗", 1)[0].lstrip("：:").strip()   # 定型文の区切り記号とリンク案内を除く
+    return ((name.group(1).strip() + " — " if name else "") + desc).strip()
 
 
 def _poc_report(it: dict) -> dict:
